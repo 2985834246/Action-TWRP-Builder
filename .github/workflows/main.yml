@@ -1,0 +1,191 @@
+# 工作流名称：Recovery 编译构建
+name: Recovery Build
+
+# 触发方式：网页手动运行，可以填写表单参数
+on:
+  workflow_dispatch:
+    inputs:
+      MANIFEST_URL:
+        description: '清单仓库地址（如果使用SSH密钥，填写 git@github.com:xxxx）'
+        required: true
+        default: 'https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp'
+      MANIFEST_BRANCH:
+        description: '清单仓库分支名'
+        required: true
+        default: 'twrp-12.1'
+      DEVICE_TREE_URL:
+        description: '设备树仓库地址'
+        required: true
+        default: 'https://github.com/TeamWin/android_device_asus_I003D'
+      DEVICE_TREE_BRANCH:
+        description: '设备树仓库分支'
+        required: true
+        default: 'android-12.1'
+      DEVICE_PATH:
+        description: '设备树在源码内的存放路径'
+        required: true
+        default: 'device/asus/I003D'
+      COMMON_TREE_URL:
+        description: '公共设备树地址（无公共树则留空）'
+        required: false
+      COMMON_PATH:
+        description: '公共树在源码内路径（无公共树则留空）'
+        required: false
+      DEVICE_NAME:
+        description: '设备代号'
+        required: true
+        default: 'I003D'
+      MAKEFILE_NAME:
+        description: '产品Makefile文件名（不带 .mk）'
+        required: true
+        default: 'twrp_I003D'
+      BUILD_TARGET:
+        description: '编译目标（一般填 recovery）'
+        required: true
+        default: 'recovery'
+
+jobs:
+  build:
+    # 安全限制：只有仓库所有者才能触发本次编译
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+    - name: 展示本次编译输入参数
+      run: |
+        echo "::group::用户环境变量信息"
+        echo "清单仓库地址: ${{ github.event.inputs.MANIFEST_URL }}"
+        echo "清单分支: ${{ github.event.inputs.MANIFEST_BRANCH }}"
+        echo "设备树地址: ${{ github.event.inputs.DEVICE_TREE_URL }}"
+        echo "设备树分支: ${{ github.event.inputs.DEVICE_TREE_BRANCH }}"
+        echo "源码内设备树路径: ${{ github.event.inputs.DEVICE_PATH }}"
+        echo "设备代号: ${{ github.event.inputs.DEVICE_NAME }}"
+        echo "Makefile名称: ${{ github.event.inputs.MAKEFILE_NAME }}"
+        echo "编译目标: ${{ github.event.inputs.BUILD_TARGET }}.img"
+        echo "::endgroup::"
+
+    # 检出当前仓库代码（非必需）
+    - name: 检出仓库
+      uses: actions/checkout@v4
+
+    # 清理工作目录
+    - name: 清理环境
+      uses: rokibhasansagar/slimhub_actions@main
+
+    # 安装编译依赖包
+    - name: 准备编译环境
+      run: |
+        sudo apt update && sudo apt upgrade -y
+        DEBIAN_FRONTEND=noninteractive sudo apt install -yq \
+            linux-modules-extra-$(uname -r) \
+            gperf gcc-multilib gcc-10-multilib g++-multilib g++-10-multilib \
+            libc6-dev lib32ncurses-dev x11proto-core-dev libx11-dev tree lib32z-dev libgl1-mesa-dev libxml2-utils \
+            xsltproc bc ccache lib32readline-dev lib32z1-dev liblz4-tool libncurses-dev libsdl1.2-dev \
+            build-essential libgtk-3-dev libglu1-mesa-dev freeglut3-dev git libxml2 lzop pngcrush schedtool squashfs-tools \
+            imagemagick libbz2-dev lzma ncftp qemu-user-static libstdc++-10-dev libncurses6 python3 tar
+
+    # 安装Java环境
+    - name: 安装 OpenJDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '11'
+
+    # SSH密钥配置（私有仓库拉取源码用）
+    - name: 配置SSH密钥
+      if: ${{ startsWith(github.event.inputs.MANIFEST_URL, 'git@github.com') || 
+          startsWith(github.event.inputs.DEVICE_TREE_URL, 'git@github.com') ||
+          startsWith(github.event.inputs.COMMON_TREE_URL, 'git@github.com') }}
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+          ssh-private-key: |
+            ${{ secrets.SSH_PRIVATE_KEY }}
+
+    # 安装 repo 工具
+    - name: 安装 repo
+      run: |
+        mkdir ~/bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        sudo ln -sf ~/bin/repo /usr/bin/repo
+
+    # 初始化源码清单
+    - name: 初始化 repo 清单
+      run: |
+        mkdir workspace
+        cd workspace
+        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
+        git config --global user.name "Nico170420"
+        git config --global user.email "b170420nc@gmail.com"
+        repo init --depth=1 -u ${{ github.event.inputs.MANIFEST_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
+      id: pwd
+
+    # 同步源码
+    - name: Repo 同步源码
+      run: |
+        repo sync -j$(nproc --all) --force-sync
+      working-directory: workspace
+
+    # 拉取设备树
+    - name: 克隆设备树
+      run: |
+        git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    # 拉取公共设备树（如果填写地址才执行）
+    - name: 克隆公共设备树
+      if: |
+        github.event.inputs.COMMON_TREE_URL != null
+        && github.event.inputs.COMMON_PATH != null
+      run: |
+        git clone ${{ github.event.inputs.COMMON_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.COMMON_PATH }}
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    # 判断源码类型：twrp / omni
+    - name: 判断源码构建类型
+      uses: haya14busa/action-cond@v1
+      id: buildtree
+      with:
+        cond: ${{ github.event.inputs.MANIFEST_BRANCH == 'twrp-11' || github.event.inputs.MANIFEST_BRANCH == 'twrp-12.1' }}
+        if_true: twrp
+        if_false: omni
+
+    # 同步设备依赖
+    - name: 同步设备依赖文件
+      run: |
+        bash ${GITHUB_WORKSPACE}/scripts/convert.sh ${{ github.event.inputs.DEVICE_PATH }}/${{ steps.buildtree.outputs.value }}.dependencies
+        repo sync -j$(nproc --all)
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      continue-on-error: true
+
+    # 配置交换内存，防止编译内存不足OOM
+    - name: 设置Swap交换分区
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 12
+
+    # 执行TWRP编译
+    - name: 编译Recovery镜像
+      run: |
+        source build/envsetup.sh
+        export ALLOW_MISSING_DEPENDENCIES=true
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng && make clean && make ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    # 编译完成，自动上传产物到Release
+    - name: 上传编译产物至Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: | 
+          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_TARGET }}.img
+          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*vendor*.img
+        name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          源码清单分支: ${{ github.event.inputs.MANIFEST_BRANCH }}
+          设备代号: ${{ github.event.inputs.DEVICE_NAME }}
+          编译目标: ${{ github.event.inputs.BUILD_TARGET }}.img
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
